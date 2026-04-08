@@ -64,12 +64,16 @@ class FitDataToMusicMapper:
         
         fx_volume = row.get('speed_norm', 0.5)
         
+        # 追加された音楽パラメータ (サイドチェイン強度)
+        sidechain_intensity = row.get('sidechain_intensity', 0.0)
+        
         return {
             'synth_intensity': synth_intensity,
             'pad_volume': pad_volume,
             'is_uphill': is_uphill,
             'hihat_on': hihat_on,
-            'fx_volume': fx_volume
+            'fx_volume': fx_volume,
+            'sidechain_intensity': sidechain_intensity
         }
 
 class ProgressiveHouseGenerator:
@@ -149,6 +153,34 @@ class ProgressiveHouseGenerator:
         track = track.apply_gain(high_boost)
         
         return track[:duration_ms]
+        
+    def _apply_sidechain(self, track: AudioSegment, intensity: float):
+        """
+        キックに合わせてボリュームをダッキングするサイドチェインエフェクト
+        intensity (0.0 - 1.0) に応じてダッキングの深さを調整する
+        """
+        if intensity <= 0.0:
+            return track
+            
+        # 最大20dB下げる
+        duck_db = - (intensity * 20.0)
+        duck_duration = 100  # キックが鳴る最初の100msをダッキング
+        
+        result = AudioSegment.silent(duration=0)
+        # トラックを1拍ごとに分割して処理
+        for i in range(0, len(track), self.beat_ms):
+            beat = track[i:i + self.beat_ms]
+            if len(beat) > duck_duration:
+                # 前半部分をダッキング
+                ducked = beat[:duck_duration].apply_gain(duck_db)
+                rest = beat[duck_duration:]
+                # フェードを入れてノイズを防ぐ
+                ducked = ducked.fade_out(10)
+                rest = rest.fade_in(10)
+                result += (ducked + rest)
+            else:
+                result += beat.apply_gain(duck_db)
+        return result
 
     def generate_track(self, progress_callback=None):
         """全データに基づき楽曲全体を生成"""
@@ -164,6 +196,12 @@ class ProgressiveHouseGenerator:
             fx = self._generate_fx_noise(1000, params['fx_volume'])
             synth = self._generate_synth_arp(1000, params['synth_intensity'])
             
+            # パッド、FX、シンセにサイドチェインを適用
+            sidechain_int = params['sidechain_intensity']
+            pad = self._apply_sidechain(pad, sidechain_int)
+            fx = self._apply_sidechain(fx, sidechain_int)
+            synth = self._apply_sidechain(synth, sidechain_int)
+            
             mix_1sec = kick.overlay(hihat).overlay(pad).overlay(fx).overlay(synth)
             
             final_mix = final_mix.overlay(mix_1sec, position=sec * 1000)
@@ -172,6 +210,48 @@ class ProgressiveHouseGenerator:
                 progress_callback(sec + 1, total_seconds)
             
         return final_mix
+
+def apply_musical_fx_params(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    ランニングフォームの質を音楽の表情に変えるためのパラメータを計算して付与する
+    
+    1. vertical_oscillation (上下動: mm単位)
+    2. stance_time (接地時間: ms単位)
+    3. running_power (パワー: W単位) -> サイドチェイン強度(sidechain_intensity)
+    """
+    # 各項目のユーザー基準値の定数定義
+    BASE_VERTICAL_OSCILLATION = 80.0  # 平均的な上下動 (mm)
+    BASE_STANCE_TIME = 250.0          # 平均的な接地時間 (ms)
+    BASE_POWER = 200.0                # 平均的なパワー (W)
+    
+    # 上下動・接地時間の補完（存在しない場合は0）
+    for col in ['vertical_oscillation', 'stance_time']:
+        if col not in df.columns:
+            df[col] = 0.0
+        else:
+            df[col] = df[col].ffill().fillna(0.0)
+            
+    # パワーの補完 (FITデータでは 'power' カラムに入ることが多い)
+    if 'power' in df.columns and 'running_power' not in df.columns:
+        df['running_power'] = df['power']
+        
+    if 'running_power' not in df.columns:
+        df['running_power'] = 0.0
+    else:
+        df['running_power'] = df['running_power'].ffill().fillna(0.0)
+        
+    # パワー ➔ サイドチェイン強度の計算 (0.0 〜 1.0)
+    # パワーが高いほど、テクノ特有のサイドチェイン効果（ボリュームダッキング）を深くする
+    # 例として基準値(200W)の半分から1.5倍の範囲を0.0〜1.0にマッピングする
+    min_power = BASE_POWER * 0.5
+    max_power = BASE_POWER * 1.5
+    
+    if max_power > min_power:
+        df['sidechain_intensity'] = ((df['running_power'] - min_power) / (max_power - min_power)).clip(0.0, 1.0)
+    else:
+        df['sidechain_intensity'] = 0.0
+        
+    return df
 
 def parse_fit_data(file_bytes) -> pd.DataFrame:
     """FITファイルをパースしてPandas DataFrameに変換する"""
@@ -189,19 +269,23 @@ def parse_fit_data(file_bytes) -> pd.DataFrame:
         
     df = pd.DataFrame(records)
     
-    # 必要なカラムの欠損値を補完 (pandas 2.0+ 互換の ffill 使用)
-    if 'heart_rate' in df.columns:
-        df['heart_rate'] = df['heart_rate'].ffill().fillna(120)
-    if 'elevation' in df.columns:
-        df['elevation'] = df['elevation'].ffill().fillna(0)
-    # FITデータでは標高は altitude という名前で保存されることが多いのでその対応も追加
-    elif 'altitude' in df.columns:
-        df['elevation'] = df['altitude'].ffill().fillna(0)
-
-    if 'cadence' in df.columns:
-        df['cadence'] = df['cadence'].ffill().fillna(0)
-    if 'speed' in df.columns:
-        df['speed'] = df['speed'].ffill().fillna(0)
+    if len(df) > 0:
+        # データマッピングと音楽的エフェクト用パラメータの生成
+        df = apply_musical_fx_params(df)
+        
+        # 必要なカラムの欠損値を補完 (pandas 2.0+ 互換の ffill 使用)
+        if 'heart_rate' in df.columns:
+            df['heart_rate'] = df['heart_rate'].ffill().fillna(120)
+        if 'elevation' in df.columns:
+            df['elevation'] = df['elevation'].ffill().fillna(0)
+        # FITデータでは標高は altitude という名前で保存されることが多いのでその対応も追加
+        elif 'altitude' in df.columns:
+            df['elevation'] = df['altitude'].ffill().fillna(0)
+    
+        if 'cadence' in df.columns:
+            df['cadence'] = df['cadence'].ffill().fillna(0)
+        if 'speed' in df.columns:
+            df['speed'] = df['speed'].ffill().fillna(0)
         
     return df
 
@@ -217,6 +301,7 @@ def main():
     * **標高/斜度** ➔ パッド音量とコード進行（上り: マイナー, 下り: メジャー）
     * **ケイデンス** ➔ 180spm付近で裏打ちハイハット
     * **速度** ➔ 疾走感のあるライザー音 (ホワイトノイズ)
+    * **パワー** ➔ キックに合わせたサイドチェイン（ダッキング）効果の深さ
     """)
     
     uploaded_file = st.file_uploader("FITファイルをアップロードしてください", type=["fit"])
