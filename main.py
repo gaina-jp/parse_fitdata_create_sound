@@ -25,12 +25,24 @@ class FitDataToMusicMapper:
 
     def _normalize_data(self):
         """各種FITデータの正規化"""
-        # 心拍数 (例: 100〜180の範囲を0.0〜1.0に正規化)
-        hr_min, hr_max = 100, 180
+        # 心拍数 (例: 80〜200の範囲を0.0〜1.0に正規化)
+        hr_min, hr_max = 80, 200 
         if 'heart_rate' in self.df.columns:
             self.df['hr_norm'] = ((self.df['heart_rate'] - hr_min) / (hr_max - hr_min)).clip(0, 1)
         else:
             self.df['hr_norm'] = 0.5
+            
+        # 上下動 (vertical_oscillation) (動的に最小・最大を取得して正規化)
+        if 'vertical_oscillation' in self.df.columns:
+            vo = self.df['vertical_oscillation']
+            vo_min = vo.min()
+            vo_max = vo.max()
+            if vo_max > vo_min:
+                self.df['vo_norm'] = ((vo - vo_min) / (vo_max - vo_min)).clip(0, 1)
+            else:
+                self.df['vo_norm'] = 0.5
+        else:
+            self.df['vo_norm'] = 0.5
         
         # 標高 (全データの獲得標高と下降標高の平均をもとめた平均標高を求める)
         if 'elevation' in self.df.columns:
@@ -67,6 +79,7 @@ class FitDataToMusicMapper:
         row = self.df.iloc[sec]
         
         synth_intensity = row.get('hr_norm', 0.5)
+        vo_norm = row.get('vo_norm', 0.5)
         
         cadence = row.get('cadence', 0)
         hihat_on = 175 <= cadence <= 185
@@ -88,7 +101,8 @@ class FitDataToMusicMapper:
             'hihat_on': hihat_on,
             'fx_volume': fx_volume,
             'sidechain_intensity': sidechain_intensity,
-            'lat_norm': lat_norm
+            'lat_norm': lat_norm,
+            'vo_norm': vo_norm
         }
 
 def generate_heavy_kick(duration=0.25, sample_rate=44100):
@@ -249,11 +263,25 @@ class ProgressiveHouseGenerator:
         noise = noise.apply_gain(target_db - noise.dBFS)
         return noise
         
-    def _generate_synth_arp(self, duration_ms, intensity):
+    def _generate_synth_arp(self, duration_ms, intensity, vo_norm):
         num_notes = 2 if intensity < 0.5 else 4
         note_duration = self.beat_ms // num_notes
         
-        freqs = [440.0, 554.37, 659.25, 880.0]
+        # マイナーペンタトニックスケール (A Minor Pentatonic: A, C, D, E, G)
+        # 複数オクターブ分の周波数を定義
+        pentatonic_notes = [
+            220.00, 261.63, 293.66, 329.63, 392.00, # A3, C4, D4, E4, G4
+            440.00, 523.25, 587.33, 659.25, 783.99, # A4, C5, D5, E5, G5
+            880.00, 1046.50, 1174.66, 1318.51, 1567.98 # A5, C6, D6, E6, G6
+        ]
+        
+        # vo_norm (0.0 - 1.0) に応じて使用する音階の範囲（開始インデックス）を決定
+        max_idx = len(pentatonic_notes) - 4
+        start_idx = int(vo_norm * max_idx)
+        start_idx = max(0, min(max_idx, start_idx))
+        
+        freqs = pentatonic_notes[start_idx : start_idx + 4]
+        
         track = AudioSegment.silent(duration=0)
         
         loops = int(np.ceil(duration_ms / note_duration))
@@ -343,7 +371,7 @@ class ProgressiveHouseGenerator:
             kick = self._generate_kick(1000)
             hihat = self._generate_hihat(1000, params['hihat_on'])
             fx = self._generate_fx_noise(1000, params['fx_volume'])
-            synth = self._generate_synth_arp(1000, params['synth_intensity'])
+            synth = self._generate_synth_arp(1000, params['synth_intensity'], params['vo_norm'])
             lat_square = self._generate_lat_square(1000, params['lat_norm'])
             
             # その1秒間に対応する正弦波(Sine)トラックの部分を上昇・下降で切り替える
@@ -661,6 +689,7 @@ def main():
     **180 BPM の爽快なプログレッシブハウス** に変換します！
     
     * **心拍数** ➔ シンセの激しさ
+    * **上下動 (Vertical Oscillation)** ➔ シンセサイザーの音階 (マイナーペンタトニックスケール)
     * **標高/斜度** ➔ 全データの平均標高をベースにした正弦波（Sine）の音程
       * 上昇時・平坦: 8分休符・8分音符の繰り返し
       * 下降時: 4分休符・1拍3連符の繰り返し
