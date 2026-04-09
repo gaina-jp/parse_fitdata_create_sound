@@ -76,6 +76,48 @@ class FitDataToMusicMapper:
             'sidechain_intensity': sidechain_intensity
         }
 
+def generate_heavy_kick(duration=0.25, sample_rate=44100):
+    """
+    プログレッシブハウスに適した、重くてパンチのあるヘビー・キックを生成する
+    """
+    t = np.linspace(0, duration, int(sample_rate * duration), endpoint=False)
+    
+    # 1. Pitch Envelope (ピッチ・エンベロープ)
+    # 開始周波数150Hz付近から40-50Hzへ指数関数的に急降下
+    f_start = 150.0
+    f_end = 45.0
+    pitch_decay = 40.0
+    f_env = (f_start - f_end) * np.exp(-pitch_decay * t) + f_end
+    
+    # 周波数を積分して位相を計算
+    phase = 2 * np.pi * np.cumsum(f_env) / sample_rate
+    
+    # 2. Sine Wave Base
+    waveform = np.sin(phase)
+    
+    # 3. Saturation / Clipping (歪み)
+    # tanh関数でソフトクリッピングし倍音を付加
+    drive = 3.0
+    waveform = np.tanh(waveform * drive)
+    
+    # 4. Decay (減衰)
+    # 滑らかに減衰するよう指数関数をかける
+    amp_decay = 15.0
+    envelope = np.exp(-amp_decay * t)
+    waveform = waveform * envelope
+    
+    # int16 形式の ndarray に変換 (-32768 ~ 32767)
+    waveform_int16 = np.int16(waveform * 32767)
+    
+    # pydub の AudioSegment オブジェクトに変換して返す
+    kick = AudioSegment(
+        waveform_int16.tobytes(),
+        frame_rate=sample_rate,
+        sample_width=2,
+        channels=1
+    )
+    return kick
+
 class ProgressiveHouseGenerator:
     """
     パラメータに基づき、pydubとnumpyを用いてプログレッシブハウスのトラックを生成するクラス
@@ -86,10 +128,15 @@ class ProgressiveHouseGenerator:
         self.beat_ms = self.mapper.beat_duration_ms
         
     def _generate_kick(self, duration_ms):
-        kick_sound = Sine(60).to_audio_segment(duration=100).apply_gain(5)
-        silence = AudioSegment.silent(duration=self.beat_ms - 100)
-        one_beat = kick_sound + silence
+        kick_sound = generate_heavy_kick(duration=0.25, sample_rate=self.sample_rate)
         
+        kick_len = len(kick_sound)
+        if kick_len < self.beat_ms:
+            silence = AudioSegment.silent(duration=self.beat_ms - kick_len)
+            one_beat = kick_sound + silence
+        else:
+            one_beat = kick_sound[:self.beat_ms]
+            
         beats_needed = int(np.ceil(duration_ms / self.beat_ms))
         track = one_beat * beats_needed
         return track[:duration_ms]
@@ -220,9 +267,7 @@ def apply_musical_fx_params(df: pd.DataFrame) -> pd.DataFrame:
     3. running_power (パワー: W単位) -> サイドチェイン強度(sidechain_intensity)
     """
     # 各項目のユーザー基準値の定数定義
-    BASE_VERTICAL_OSCILLATION = 80.0  # 平均的な上下動 (mm)
-    BASE_STANCE_TIME = 250.0          # 平均的な接地時間 (ms)
-    BASE_POWER = 200.0                # 平均的なパワー (W)
+    base_power = 200.0                # 平均的なパワー (W)
     
     # 上下動・接地時間の補完（存在しない場合は0）
     for col in ['vertical_oscillation', 'stance_time']:
@@ -243,8 +288,8 @@ def apply_musical_fx_params(df: pd.DataFrame) -> pd.DataFrame:
     # パワー ➔ サイドチェイン強度の計算 (0.0 〜 1.0)
     # パワーが高いほど、テクノ特有のサイドチェイン効果（ボリュームダッキング）を深くする
     # 例として基準値(200W)の半分から1.5倍の範囲を0.0〜1.0にマッピングする
-    min_power = BASE_POWER * 0.5
-    max_power = BASE_POWER * 1.5
+    min_power = base_power * 0.5
+    max_power = base_power * 1.5
     
     if max_power > min_power:
         df['sidechain_intensity'] = ((df['running_power'] - min_power) / (max_power - min_power)).clip(0.0, 1.0)
@@ -252,6 +297,27 @@ def apply_musical_fx_params(df: pd.DataFrame) -> pd.DataFrame:
         df['sidechain_intensity'] = 0.0
         
     return df
+
+def resample_dataframe(df: pd.DataFrame, target_seconds: int) -> pd.DataFrame:
+    """
+    データフレーム全体を選択された秒数(target_seconds)にリサンプル（圧縮）する
+    """
+    total_len = len(df)
+    if total_len <= target_seconds:
+        # データの長さが指定秒数以下の場合はそのまま返す
+        return df
+
+    # グループ数を target_seconds に設定
+    # index をもとにグループ化: group_id = index * target_seconds // total_len
+    # 各グループの平均値をとることで圧縮する
+    
+    df_reset = df.reset_index(drop=True)
+    # FITデータには数値以外のカラム（日時、文字列など）が含まれる可能性があるため
+    # numeric_only=True を指定して平均値を計算します
+    group_ids = (df_reset.index * target_seconds) // total_len
+    resampled_df = df_reset.groupby(group_ids).mean(numeric_only=True)
+    
+    return resampled_df
 
 def parse_fit_data(file_bytes) -> pd.DataFrame:
     """FITファイルをパースしてPandas DataFrameに変換する"""
@@ -316,15 +382,24 @@ def main():
                 
             st.write("### 解析されたデータ (一部)")
             st.dataframe(df.head())
-            st.write(f"総データ秒数: {len(df)} 秒")
+            total_data_seconds = len(df)
+            st.write(f"総データ秒数: {total_data_seconds} 秒")
             
-            # 長すぎると処理に時間がかかるため制限を設けるオプション
-            max_seconds = st.slider("生成する長さ(秒)を選択してください", min_value=10, max_value=min(600, len(df)), value=min(60, len(df)), step=10)
+            # 生成する長さを選択。デフォルトは60秒。
+            max_seconds = st.slider(
+                "生成する音楽の長さ(秒)を選択してください。全データをこの長さに圧縮(平均化)します。", 
+                min_value=10, 
+                max_value=min(600, total_data_seconds), 
+                value=min(60, total_data_seconds), 
+                step=10
+            )
             
             if st.button("🎵 音楽を生成する"):
-                df_subset = df.head(max_seconds).copy()
+                # 全データを指定した秒数にリサンプル（平均化）する
+                df_resampled = resample_dataframe(df, max_seconds)
                 
-                mapper = FitDataToMusicMapper(df_subset, bpm=180)
+                # リサンプル後のデータフレームをマッパーに渡す
+                mapper = FitDataToMusicMapper(df_resampled, bpm=180)
                 generator = ProgressiveHouseGenerator(mapper)
                 
                 progress_bar = st.progress(0)
