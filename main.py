@@ -1,10 +1,14 @@
 import numpy as np
 import pandas as pd
 from pydub import AudioSegment
-from pydub.generators import WhiteNoise, Sine
+from pydub.generators import WhiteNoise, Sine, Square
 import streamlit as st
 import fitdecode
 import io
+import warnings
+
+# fitdecodeの読み込み時に発生する型サイズの警告を無視する
+warnings.filterwarnings('ignore', category=UserWarning, module='fitdecode')
 
 class FitDataToMusicMapper:
     """
@@ -28,18 +32,17 @@ class FitDataToMusicMapper:
         else:
             self.df['hr_norm'] = 0.5
         
-        # 標高
+        # 標高 (全データの獲得標高と下降標高の平均をもとめた平均標高を求める)
         if 'elevation' in self.df.columns:
-            elev_min, elev_max = self.df['elevation'].min(), self.df['elevation'].max()
-            if elev_max > elev_min:
-                self.df['elev_norm'] = (self.df['elevation'] - elev_min) / (elev_max - elev_min)
-            else:
-                self.df['elev_norm'] = 0.0
-
-            # 斜度 (上りか下りか)
-            self.df['grade'] = self.df['elevation'].diff().fillna(0)
+            diff = self.df['elevation'].diff().fillna(0)
+            total_gain = diff[diff > 0].sum()
+            total_loss = abs(diff[diff < 0].sum())
+            self.avg_elevation_from_gain_loss = (total_gain + total_loss) / 2
+            
+            # 斜度 (上りか下りか) を差分として保存
+            self.df['grade'] = diff
         else:
-            self.df['elev_norm'] = 0.5
+            self.avg_elevation_from_gain_loss = 0.0
             self.df['grade'] = 0.0
 
         # 速度
@@ -48,6 +51,14 @@ class FitDataToMusicMapper:
             self.df['speed_norm'] = (self.df['speed'] / speed_max).clip(0, 1)
         else:
             self.df['speed_norm'] = 0.5
+            
+        # 緯度 (position_lat)
+        if 'position_lat' in self.df.columns:
+            # 緯度は-90から90の範囲。日本の緯度を考慮し、30-45度あたりを0-1に正規化
+            lat_min, lat_max = 30, 45 
+            self.df['lat_norm'] = ((self.df['position_lat'] - lat_min) / (lat_max - lat_min)).clip(0, 1)
+        else:
+            self.df['lat_norm'] = 0.5
 
     def get_music_params_at_second(self, sec: int):
         """指定秒数の音楽制御パラメータを取得"""
@@ -56,8 +67,6 @@ class FitDataToMusicMapper:
         row = self.df.iloc[sec]
         
         synth_intensity = row.get('hr_norm', 0.5)
-        pad_volume = row.get('elev_norm', 0.5)
-        is_uphill = row.get('grade', 0) > 0
         
         cadence = row.get('cadence', 0)
         hihat_on = 175 <= cadence <= 185
@@ -67,13 +76,19 @@ class FitDataToMusicMapper:
         # 追加された音楽パラメータ (サイドチェイン強度)
         sidechain_intensity = row.get('sidechain_intensity', 0.0)
         
+        # 緯度のパラメータを追加
+        lat_norm = row.get('lat_norm', 0.5)
+        
+        # 斜度の判定 (0以上なら上昇/平坦、未満なら下降)
+        is_uphill = row.get('grade', 0) >= 0
+        
         return {
             'synth_intensity': synth_intensity,
-            'pad_volume': pad_volume,
             'is_uphill': is_uphill,
             'hihat_on': hihat_on,
             'fx_volume': fx_volume,
-            'sidechain_intensity': sidechain_intensity
+            'sidechain_intensity': sidechain_intensity,
+            'lat_norm': lat_norm
         }
 
 def generate_heavy_kick(duration=0.25, sample_rate=44100):
@@ -126,6 +141,8 @@ class ProgressiveHouseGenerator:
         self.mapper = mapper
         self.sample_rate = 44100
         self.beat_ms = self.mapper.beat_duration_ms
+        # 8分音符の長さ (四分音符の半分)
+        self.eighth_note_ms = self.beat_ms // 2
         
     def _generate_kick(self, duration_ms):
         kick_sound = generate_heavy_kick(duration=0.25, sample_rate=self.sample_rate)
@@ -155,21 +172,72 @@ class ProgressiveHouseGenerator:
         track = one_beat * beats_needed
         return track[:duration_ms]
         
-    @staticmethod
-    def _generate_pad(duration_ms, volume_norm, is_uphill):
-        if is_uphill:
-            freqs = [220.0, 261.63, 329.63]
-        else:
-            freqs = [261.63, 329.63, 392.00]
-            
-        pad = AudioSegment.silent(duration=duration_ms)
-        for f in freqs:
-            tone = Sine(f).to_audio_segment(duration=duration_ms)
-            pad = pad.overlay(tone)
-            
-        target_db = -25 + (volume_norm * 20)
-        pad = pad.apply_gain(target_db - pad.dBFS)
-        return pad
+    def _generate_uphill_sine_track(self, total_duration_ms, avg_elev):
+        """
+        平均標高に基づき、上昇時の(8分休符 + 8分音符) x 4 のリズムを持つSine波トラックを生成する
+        """
+        normalized_elev = min(max(avg_elev, 0), 1000) / 1000.0
+        freq = 261.63 * (2 ** (normalized_elev * 2))
+        
+        # 8分音符 (音を鳴らす) と 8分休符 (無音)
+        note_duration = self.eighth_note_ms
+        silence_duration = self.eighth_note_ms
+        
+        # 正弦波を生成 (音が大きすぎないようにゲインを調整)
+        tone = Sine(freq).to_audio_segment(duration=note_duration).apply_gain(-15)
+        
+        # 音が滑らかに繋がるように短いフェードを追加
+        fade_time = min(20, note_duration // 4)
+        tone = tone.fade_in(fade_time).fade_out(fade_time)
+        
+        silence = AudioSegment.silent(duration=silence_duration)
+        
+        # (8分休符 + 8分音符) の1ペア (これで四分音符1個分 = 1拍)
+        one_pair = silence + tone
+        
+        # トラック全体をカバーする長さまで繰り返す
+        beats_needed = int(np.ceil(total_duration_ms / self.beat_ms))
+        track = (one_pair * beats_needed)[:total_duration_ms]
+        
+        return track
+
+    def _generate_downhill_sine_track(self, total_duration_ms, avg_elev):
+        """
+        平均標高に基づき、下降時の(4分休符 + 1拍3連符) のリズムを持つSine波トラックを生成する
+        """
+        normalized_elev = min(max(avg_elev, 0), 1000) / 1000.0
+        freq = 261.63 * (2 ** (normalized_elev * 2))
+        
+        # 4分休符 (1拍)
+        quarter_rest = AudioSegment.silent(duration=self.beat_ms)
+        
+        # 1拍3連符 (1拍を3等分)
+        triplet_note_duration = self.beat_ms // 3
+        # 少しスタッカートにして音を区切る
+        tone_duration = triplet_note_duration - 10
+        silence_duration = 10
+        
+        tone = Sine(freq).to_audio_segment(duration=tone_duration).apply_gain(-15)
+        fade_time = min(10, tone_duration // 4)
+        tone = tone.fade_in(fade_time).fade_out(fade_time)
+        silence = AudioSegment.silent(duration=silence_duration)
+        
+        one_triplet_note = tone + silence
+        triplet_beat = one_triplet_note * 3
+        
+        # 念のため1拍分の長さに厳密に合わせる
+        if len(triplet_beat) < self.beat_ms:
+            triplet_beat += AudioSegment.silent(duration=self.beat_ms - len(triplet_beat))
+        triplet_beat = triplet_beat[:self.beat_ms]
+        
+        # (4分休符 + 1拍3連符) = 2拍分のパターン
+        two_beat_pattern = quarter_rest + triplet_beat
+        
+        # トラック全体をカバーする長さまで繰り返す
+        patterns_needed = int(np.ceil(total_duration_ms / (self.beat_ms * 2)))
+        track = (two_beat_pattern * patterns_needed)[:total_duration_ms]
+        
+        return track
         
     @staticmethod
     def _generate_fx_noise(duration_ms, intensity):
@@ -198,6 +266,35 @@ class ProgressiveHouseGenerator:
             
         high_boost = intensity * 8
         track = track.apply_gain(high_boost)
+        
+        return track[:duration_ms]
+        
+    def _generate_lat_square(self, duration_ms, lat_norm):
+        """
+        緯度に応じて音程（周波数）が変わる矩形波（Square）を4拍子（4つ打ち）で生成する
+        lat_norm (0.0 - 1.0) を基に、ベース音域の周波数（例: C2=65.41Hz 〜 C4=261.63Hz）にマッピング
+        """
+        min_freq = 65.41  # C2
+        max_freq = 261.63 # C4
+        freq = min_freq + (max_freq - min_freq) * lat_norm
+        
+        # 1拍あたりの音の長さ（スタッカート気味に短くする）
+        note_duration = min(150, self.beat_ms - 20) 
+        
+        # 矩形波を生成し、少し音量を下げる（矩形波は目立つため）
+        tone = Square(freq).to_audio_segment(duration=note_duration).apply_gain(-15)
+        
+        # 1拍分の長さに調整 (音 + 無音)
+        silence_duration = self.beat_ms - note_duration
+        if silence_duration > 0:
+            silence = AudioSegment.silent(duration=silence_duration)
+            one_beat = tone + silence
+        else:
+            one_beat = tone[:self.beat_ms]
+            
+        # 必要な拍数分繰り返す (4拍子で鳴らすため1拍ごとに鳴る)
+        beats_needed = int(np.ceil(duration_ms / self.beat_ms))
+        track = one_beat * beats_needed
         
         return track[:duration_ms]
         
@@ -234,22 +331,35 @@ class ProgressiveHouseGenerator:
         total_seconds = len(self.mapper.df)
         final_mix = AudioSegment.silent(duration=total_seconds * 1000)
         
+        # 上昇時・下降時それぞれの正弦波(Sine)トラックを全曲分あらかじめ生成
+        # これにより、秒の切り替わりでリズムが崩れる（1秒＝3拍で中途半端に切れる）のを防ぎます
+        avg_elev = self.mapper.avg_elevation_from_gain_loss
+        sine_uphill_full = self._generate_uphill_sine_track(total_seconds * 1000, avg_elev)
+        sine_downhill_full = self._generate_downhill_sine_track(total_seconds * 1000, avg_elev)
+        
         for sec in range(total_seconds):
             params = self.mapper.get_music_params_at_second(sec)
             
             kick = self._generate_kick(1000)
             hihat = self._generate_hihat(1000, params['hihat_on'])
-            pad = self._generate_pad(1000, params['pad_volume'], params['is_uphill'])
             fx = self._generate_fx_noise(1000, params['fx_volume'])
             synth = self._generate_synth_arp(1000, params['synth_intensity'])
+            lat_square = self._generate_lat_square(1000, params['lat_norm'])
             
-            # パッド、FX、シンセにサイドチェインを適用
+            # その1秒間に対応する正弦波(Sine)トラックの部分を上昇・下降で切り替える
+            if params['is_uphill']:
+                sine_1sec = sine_uphill_full[sec * 1000 : (sec + 1) * 1000]
+            else:
+                sine_1sec = sine_downhill_full[sec * 1000 : (sec + 1) * 1000]
+            
+            # 各要素にサイドチェインを適用
             sidechain_int = params['sidechain_intensity']
-            pad = self._apply_sidechain(pad, sidechain_int)
             fx = self._apply_sidechain(fx, sidechain_int)
             synth = self._apply_sidechain(synth, sidechain_int)
+            lat_square = self._apply_sidechain(lat_square, sidechain_int)
+            sine_1sec = self._apply_sidechain(sine_1sec, sidechain_int)
             
-            mix_1sec = kick.overlay(hihat).overlay(pad).overlay(fx).overlay(synth)
+            mix_1sec = kick.overlay(hihat).overlay(fx).overlay(synth).overlay(lat_square).overlay(sine_1sec)
             
             final_mix = final_mix.overlay(mix_1sec, position=sec * 1000)
             
@@ -257,6 +367,229 @@ class ProgressiveHouseGenerator:
                 progress_callback(sec + 1, total_seconds)
             
         return final_mix
+
+def adjust_heart_rate_anomalies(df, threshold_bpm=10):
+    """
+    心拍数の欠落後に異常な値(小さすぎる値)が記録され、その後正常な値に戻る現象を補正する。
+    また、値が欠損している区間（NaN）も、直前の値 (b) と復帰後の正常な値 (c) の間で補間する。
+    """
+    if 'heart_rate' not in df.columns:
+        return df
+
+    # NaNかどうかを判定するためのブール配列
+    is_nan = df['heart_rate'].isna()
+
+    # 欠損の開始位置と終了位置を見つけるためのグループ化
+    # 欠損状態が変わるごとにgroupのIDが増加する
+    nan_groups = (is_nan != is_nan.shift()).cumsum()
+
+    # 補正済みのデータを格納するシリーズ
+    corrected_hr = df['heart_rate'].copy()
+
+    # 欠損しているグループのIDを取得
+    missing_group_ids = nan_groups[is_nan].unique()
+
+    for gid in missing_group_ids:
+        missing_indices = df.index[nan_groups == gid]
+        if len(missing_indices) == 0:
+            continue
+
+        first_missing_idx = missing_indices[0]
+        last_missing_idx = missing_indices[-1]
+
+        # 欠損の直前のインデックスを探す (b)
+        loc_first_missing = df.index.get_loc(first_missing_idx)
+        if loc_first_missing == 0:
+            continue # 先頭が欠損の場合は無視
+
+        b_idx = df.index[loc_first_missing - 1]
+        b_val = df.at[b_idx, 'heart_rate']
+
+        if pd.isna(b_val):
+            continue # 直前も何らかの理由でNaNなら無視
+
+        # 欠損の直後のインデックスを探す (a)
+        loc_last_missing = df.index.get_loc(last_missing_idx)
+        if loc_last_missing >= len(df) - 1:
+            continue # 末尾が欠損の場合は無視
+
+        a_idx = df.index[loc_last_missing + 1]
+        a_val = df.at[a_idx, 'heart_rate']
+
+        if pd.isna(a_val):
+            continue
+
+        # (a) が (b) より明らかに小さいかチェック
+        if b_val - a_val >= threshold_bpm:
+            # 異常な急降下があった場合
+            # (c) を探す: a_idx より後で、値が b_val ± 2 になる最初のポイント
+            c_idx = None
+            c_val = None
+
+            # a_idx の次から探索
+            search_start_loc = loc_last_missing + 1
+
+            for i in range(search_start_loc + 1, min(search_start_loc + 60, len(df))): # 最大60ポイント(約60秒)先まで探索
+                current_idx = df.index[i]
+                current_val = df.at[current_idx, 'heart_rate']
+
+                if pd.isna(current_val):
+                    continue
+
+                if abs(current_val - b_val) <= 2:
+                    c_idx = current_idx
+                    c_val = current_val
+                    break
+
+            if c_idx is not None:
+                # (b) の直後から (c) の直前までの補間を行う（NaNの部分も異常な急降下部分も含める）
+                b_loc = df.index.get_loc(b_idx)
+                c_loc = df.index.get_loc(c_idx)
+
+                # 補間対象の要素数（両端 b, c を含まない間の要素数）
+                num_points_to_interpolate = c_loc - b_loc - 1
+
+                if num_points_to_interpolate > 0:
+                    step = (c_val - b_val) / (num_points_to_interpolate + 1)
+                    interpolated_values = [round(b_val + step * (i + 1)) for i in range(num_points_to_interpolate)]
+
+                    # b_idx の次 から c_idx の直前までを置き換え
+                    for i, val in enumerate(interpolated_values):
+                        idx_to_replace = df.index[b_loc + 1 + i]
+                        corrected_hr.at[idx_to_replace] = val
+        else:
+            # 異常な急降下がなかった場合でも、NaNの区間だけを (b) と (a) の間で補間する
+            b_loc = df.index.get_loc(b_idx)
+            a_loc = df.index.get_loc(a_idx)
+
+            num_points_to_interpolate = a_loc - b_loc - 1
+            if num_points_to_interpolate > 0:
+                step = (a_val - b_val) / (num_points_to_interpolate + 1)
+                interpolated_values = [round(b_val + step * (i + 1)) for i in range(num_points_to_interpolate)]
+
+                for i, val in enumerate(interpolated_values):
+                    idx_to_replace = df.index[b_loc + 1 + i]
+                    corrected_hr.at[idx_to_replace] = val
+
+    df['heart_rate'] = corrected_hr
+    return df
+
+def speed_to_pace_str(speed_ms):
+    """m/s (秒速) を 1kmあたりのペース (M:S/km) に変換"""
+    if pd.isna(speed_ms) or speed_ms is None or speed_ms <= 0.1:
+        return None
+    sec = 1000 / speed_ms
+    minutes = int(sec // 60)
+    seconds = int(sec % 60)
+    return f"{minutes}:{seconds:02d}"
+
+def semicircles_to_degrees(semicircles):
+    """GarminのFITデータ特有のSemicircles単位を、一般的な緯度経度（Degrees）に変換する"""
+    if pd.isna(semicircles) or semicircles is None:
+        return None
+    # 変換式: degrees = semicircles * ( 180 / 2^31 )
+    return semicircles * (180.0 / (2**31))
+
+def parse_fit_data(file_bytes) -> pd.DataFrame:
+    """FITファイルをパースしてPandas DataFrameに変換し、_samlpe.py と同じ前処理を行う"""
+    data = []
+    
+    with fitdecode.FitReader(file_bytes) as fit_file:
+        for frame in fit_file:
+            if isinstance(frame, fitdecode.records.FitDataMessage) and frame.name == 'record':
+                record_data = {}
+                for field in frame.fields:
+                    record_data[field.name] = field.value
+                data.append(record_data)
+
+    if not data:
+        # 空のDataFrameを返す
+        return pd.DataFrame()
+
+    df = pd.DataFrame(data)
+
+    # 英語の列名の中に空白が入っている場合、アンダースコアに変換し小文字に統一
+    df.columns = [str(col).strip().replace(' ', '_').lower() for col in df.columns]
+
+    # 不要な従来の 'altitude' と 'speed' を削除
+    columns_to_drop = [col for col in ['altitude', 'speed'] if col in df.columns]
+    if columns_to_drop:
+        df = df.drop(columns=columns_to_drop)
+
+    # enhanced_altitude を altitude (elevation用) にリネーム
+    if 'enhanced_altitude' in df.columns:
+        df = df.rename(columns={'enhanced_altitude': 'elevation'})
+        
+    # もし altitude が残っていて elevation がない場合
+    if 'altitude' in df.columns and 'elevation' not in df.columns:
+         df = df.rename(columns={'altitude': 'elevation'})
+
+    # enhanced_speed を speed (m/sのまま、後でpace_strにも変換可能だが今回は数値として保持する)
+    # 今回は音楽生成用に 'speed' というカラム名で数値を残す必要がある
+    if 'enhanced_speed' in df.columns:
+        df['speed'] = df['enhanced_speed']
+        # 文字列のペースが欲しい場合は別カラムにする
+        df['pace'] = df['enhanced_speed'].apply(speed_to_pace_str)
+        df = df.drop(columns=['enhanced_speed'])
+
+    # effort_pace を文字列 (M:S/km) に変換
+    if 'effort_pace' in df.columns:
+        df['effort_pace'] = df['effort_pace'].apply(speed_to_pace_str)
+
+    # 位置情報(Semicircles)を緯度経度(Degrees)に変換
+    if 'position_lat' in df.columns:
+        df['position_lat'] = df['position_lat'].apply(semicircles_to_degrees)
+    if 'position_long' in df.columns:
+        df['position_long'] = df['position_long'].apply(semicircles_to_degrees)
+
+    # ストライド(step_length)を mm から cm に変換
+    if 'step_length' in df.columns:
+        df['step_length'] = df['step_length'] / 10.0
+
+    # ケイデンスを両足の歩数(spm)にするため2倍に変換
+    if 'cadence' in df.columns:
+        if 'fractional_cadence' in df.columns:
+            df['cadence'] = (df['cadence'] + df['fractional_cadence']) * 2
+        else:
+            df['cadence'] = df['cadence'] * 2
+
+    # timestampの処理とindexセット
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+        # FITファイルのタイムスタンプは通常UTCなので、JST(日本標準時)に変換する
+        if df['timestamp'].dt.tz is None:
+            df['timestamp'] = df['timestamp'].dt.tz_localize('UTC').dt.tz_convert('Asia/Tokyo')
+        else:
+            df['timestamp'] = df['timestamp'].dt.tz_convert('Asia/Tokyo')
+
+        df['timestamp'] = df['timestamp'].dt.tz_localize(None)
+
+        df = df.set_index('timestamp')
+
+    # 心拍数の異常値補正処理の追加
+    df = adjust_heart_rate_anomalies(df, threshold_bpm=15)
+    
+    # 音楽生成ロジック(FitDataToMusicMapper)は英語の列名を期待しているため、
+    # _sample.py のような日本語へのリネームはここでは行わず、元の英名カラムを維持します。
+    
+    # データマッピングと音楽的エフェクト用パラメータの生成
+    df = apply_musical_fx_params(df)
+    
+    # 必要なカラムの欠損値を補完 (pandas 2.0+ 互換の ffill 使用)
+    if 'heart_rate' in df.columns:
+        df['heart_rate'] = df['heart_rate'].ffill().fillna(120)
+    if 'elevation' in df.columns:
+        df['elevation'] = df['elevation'].ffill().fillna(0)
+    if 'position_lat' in df.columns:
+        df['position_lat'] = df['position_lat'].ffill().fillna(35) # 日本の平均的な緯度で補完
+
+    if 'cadence' in df.columns:
+        df['cadence'] = df['cadence'].ffill().fillna(0)
+    if 'speed' in df.columns:
+        df['speed'] = df['speed'].ffill().fillna(0)
+
+    return df
 
 def apply_musical_fx_params(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -319,42 +652,6 @@ def resample_dataframe(df: pd.DataFrame, target_seconds: int) -> pd.DataFrame:
     
     return resampled_df
 
-def parse_fit_data(file_bytes) -> pd.DataFrame:
-    """FITファイルをパースしてPandas DataFrameに変換する"""
-    records = []
-    
-    with fitdecode.FitReader(file_bytes) as fit:
-        for frame in fit:
-            # データの含まれるフレームのみを取得
-            if isinstance(frame, fitdecode.FitDataMessage):
-                if frame.name == 'record':
-                    data = {}
-                    for field in frame.fields:
-                        data[field.name] = field.value
-                    records.append(data)
-        
-    df = pd.DataFrame(records)
-    
-    if len(df) > 0:
-        # データマッピングと音楽的エフェクト用パラメータの生成
-        df = apply_musical_fx_params(df)
-        
-        # 必要なカラムの欠損値を補完 (pandas 2.0+ 互換の ffill 使用)
-        if 'heart_rate' in df.columns:
-            df['heart_rate'] = df['heart_rate'].ffill().fillna(120)
-        if 'elevation' in df.columns:
-            df['elevation'] = df['elevation'].ffill().fillna(0)
-        # FITデータでは標高は altitude という名前で保存されることが多いのでその対応も追加
-        elif 'altitude' in df.columns:
-            df['elevation'] = df['altitude'].ffill().fillna(0)
-    
-        if 'cadence' in df.columns:
-            df['cadence'] = df['cadence'].ffill().fillna(0)
-        if 'speed' in df.columns:
-            df['speed'] = df['speed'].ffill().fillna(0)
-        
-    return df
-
 def main():
     st.set_page_config(page_title="FIT to Music Generator", layout="centered")
     
@@ -364,7 +661,10 @@ def main():
     **180 BPM の爽快なプログレッシブハウス** に変換します！
     
     * **心拍数** ➔ シンセの激しさ
-    * **標高/斜度** ➔ パッド音量とコード進行（上り: マイナー, 下り: メジャー）
+    * **標高/斜度** ➔ 全データの平均標高をベースにした正弦波（Sine）の音程
+      * 上昇時・平坦: 8分休符・8分音符の繰り返し
+      * 下降時: 4分休符・1拍3連符の繰り返し
+    * **緯度** ➔ 矩形波（スクエアベース）の音程
     * **ケイデンス** ➔ 180spm付近で裏打ちハイハット
     * **速度** ➔ 疾走感のあるライザー音 (ホワイトノイズ)
     * **パワー** ➔ キックに合わせたサイドチェイン（ダッキング）効果の深さ
