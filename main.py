@@ -78,13 +78,15 @@ class FitDataToMusicMapper:
             return None
         row = self.df.iloc[sec]
         
-        synth_intensity = row.get('hr_norm', 0.5)
+        # 速度 -> シンセの激しさ
+        synth_intensity = row.get('speed_norm', 0.5)
         vo_norm = row.get('vo_norm', 0.5)
         
         cadence = row.get('cadence', 0)
         hihat_on = 175 <= cadence <= 185
         
-        fx_volume = row.get('speed_norm', 0.5)
+        # 心拍数 -> 疾走感のあるライザー音 (ホワイトノイズ)
+        fx_volume = row.get('hr_norm', 0.5)
         
         # 追加された音楽パラメータ (サイドチェイン強度)
         sidechain_intensity = row.get('sidechain_intensity', 0.0)
@@ -688,14 +690,14 @@ def main():
     Garmin等の **FITデータ** をアップロードして、あなたのランニングデータを
     **180 BPM の爽快なプログレッシブハウス** に変換します！
     
-    * **心拍数** ➔ シンセの激しさ
+    * **心拍数** ➔ 疾走感のあるライザー音 (ホワイトノイズ)
+    * **速度** ➔ シンセの激しさ
     * **上下動 (Vertical Oscillation)** ➔ シンセサイザーの音階 (マイナーペンタトニックスケール)
     * **標高/斜度** ➔ 全データの平均標高をベースにした正弦波（Sine）の音程
       * 上昇時・平坦: 8分休符・8分音符の繰り返し
       * 下降時: 4分休符・1拍3連符の繰り返し
     * **緯度** ➔ 矩形波（スクエアベース）の音程
     * **ケイデンス** ➔ 180spm付近で裏打ちハイハット
-    * **速度** ➔ 疾走感のあるライザー音 (ホワイトノイズ)
     * **パワー** ➔ キックに合わせたサイドチェイン（ダッキング）効果の深さ
     """)
     
