@@ -66,9 +66,14 @@ class FitDataToMusicMapper:
             
         # 緯度 (position_lat)
         if 'position_lat' in self.df.columns:
-            # 緯度は-90から90の範囲。日本の緯度を考慮し、30-45度あたりを0-1に正規化
-            lat_min, lat_max = 30, 45 
-            self.df['lat_norm'] = ((self.df['position_lat'] - lat_min) / (lat_max - lat_min)).clip(0, 1)
+            # アクティビティ全体の最小・最大に基づき 0-1 に正規化（日本国外でも対応可能にする）
+            lat_vals = self.df['position_lat']
+            lat_min = lat_vals.min()
+            lat_max = lat_vals.max()
+            if lat_max > lat_min:
+                self.df['lat_norm'] = ((lat_vals - lat_min) / (lat_max - lat_min)).clip(0, 1)
+            else:
+                self.df['lat_norm'] = 0.5
         else:
             self.df['lat_norm'] = 0.5
 
@@ -89,7 +94,8 @@ class FitDataToMusicMapper:
         fx_volume = row.get('hr_norm', 0.5)
         
         # 追加された音楽パラメータ (サイドチェイン強度)
-        sidechain_intensity = row.get('sidechain_intensity', 0.0)
+        # sidechain_intensity = row.get('sidechain_intensity', 0.0)
+        sidechain_intensity = 0.0 # 一旦無効化
         
         # 緯度のパラメータを追加
         lat_norm = row.get('lat_norm', 0.5)
@@ -357,44 +363,72 @@ class ProgressiveHouseGenerator:
         return result
 
     def generate_track(self, progress_callback=None):
-        """全データに基づき楽曲全体を生成"""
+        """全データに基づき楽曲全体を生成（高速化版）"""
         total_seconds = len(self.mapper.df)
-        final_mix = AudioSegment.silent(duration=total_seconds * 1000)
         
         # 上昇時・下降時それぞれの正弦波(Sine)トラックを全曲分あらかじめ生成
-        # これにより、秒の切り替わりでリズムが崩れる（1秒＝3拍で中途半端に切れる）のを防ぎます
         avg_elev = self.mapper.avg_elevation_from_gain_loss
         sine_uphill_full = self._generate_uphill_sine_track(total_seconds * 1000, avg_elev)
         sine_downhill_full = self._generate_downhill_sine_track(total_seconds * 1000, avg_elev)
         
+        # 各パートのリストを作成（最後に一括で連結）
+        kicks = []
+        hihats = []
+        fxs = []
+        synths = []
+        lat_squares = []
+        sines = []
+        
         for sec in range(total_seconds):
             params = self.mapper.get_music_params_at_second(sec)
             
-            kick = self._generate_kick(1000)
-            hihat = self._generate_hihat(1000, params['hihat_on'])
-            fx = self._generate_fx_noise(1000, params['fx_volume'])
-            synth = self._generate_synth_arp(1000, params['synth_intensity'], params['vo_norm'])
-            lat_square = self._generate_lat_square(1000, params['lat_norm'])
+            # 各音源を1秒分生成
+            kick_1s = self._generate_kick(1000)
+            hihat_1s = self._generate_hihat(1000, params['hihat_on'])
+            fx_1s = self._generate_fx_noise(1000, params['fx_volume'])
+            synth_1s = self._generate_synth_arp(1000, params['params']['synth_intensity'], params['vo_norm']) if isinstance(params.get('params'), dict) else self._generate_synth_arp(1000, params['synth_intensity'], params['vo_norm'])
+            lat_square_1s = self._generate_lat_square(1000, params['lat_norm'])
             
             # その1秒間に対応する正弦波(Sine)トラックの部分を上昇・下降で切り替える
             if params['is_uphill']:
-                sine_1sec = sine_uphill_full[sec * 1000 : (sec + 1) * 1000]
+                sine_1s = sine_uphill_full[sec * 1000 : (sec + 1) * 1000]
             else:
-                sine_1sec = sine_downhill_full[sec * 1000 : (sec + 1) * 1000]
+                sine_1s = sine_downhill_full[sec * 1000 : (sec + 1) * 1000]
             
-            # 各要素にサイドチェインを適用
-            sidechain_int = params['sidechain_intensity']
-            fx = self._apply_sidechain(fx, sidechain_int)
-            synth = self._apply_sidechain(synth, sidechain_int)
-            lat_square = self._apply_sidechain(lat_square, sidechain_int)
-            sine_1sec = self._apply_sidechain(sine_1sec, sidechain_int)
+            # サイドチェインを適用 (コメントアウトにより効果を無効化)
+            # sidechain_int = params['sidechain_intensity']
+            # fx_1s = self._apply_sidechain(fx_1s, sidechain_int)
+            # synth_1s = self._apply_sidechain(synth_1s, sidechain_int)
+            # lat_square_1s = self._apply_sidechain(lat_square_1s, sidechain_int)
+            # sine_1s = self._apply_sidechain(sine_1s, sidechain_int)
             
-            mix_1sec = kick.overlay(hihat).overlay(fx).overlay(synth).overlay(lat_square).overlay(sine_1sec)
-            
-            final_mix = final_mix.overlay(mix_1sec, position=sec * 1000)
+            # リストに追加
+            kicks.append(kick_1s)
+            hihats.append(hihat_1s)
+            fxs.append(fx_1s)
+            synths.append(synth_1s)
+            lat_squares.append(lat_square_1s)
+            sines.append(sine_1s)
             
             if progress_callback:
                 progress_callback(sec + 1, total_seconds)
+        
+        # トラックごとに連結（AudioSegmentの結合は効率的）
+        def combine_list(segments):
+            res = segments[0]
+            for s in segments[1:]:
+                res += s
+            return res
+
+        full_kick = combine_list(kicks)
+        full_hihat = combine_list(hihats)
+        full_fx = combine_list(fxs)
+        full_synth = combine_list(synths)
+        full_lat_square = combine_list(lat_squares)
+        full_sine = combine_list(sines)
+        
+        # 最後に全てのトラックを重ねる（overlayは全曲に対して1回ずつ）
+        final_mix = full_kick.overlay(full_hihat).overlay(full_fx).overlay(full_synth).overlay(full_lat_square).overlay(full_sine)
             
         return final_mix
 
@@ -680,6 +714,12 @@ def resample_dataframe(df: pd.DataFrame, target_seconds: int) -> pd.DataFrame:
     group_ids = (df_reset.index * target_seconds) // total_len
     resampled_df = df_reset.groupby(group_ids).mean(numeric_only=True)
     
+    # ケイデンスや心拍数などは整数に丸める
+    round_cols = ['heart_rate', 'cadence']
+    for col in round_cols:
+        if col in resampled_df.columns:
+            resampled_df[col] = resampled_df[col].round().astype(int)
+
     return resampled_df
 
 def main():
@@ -698,7 +738,7 @@ def main():
       * 下降時: 4分休符・1拍3連符の繰り返し
     * **緯度** ➔ 矩形波（スクエアベース）の音程
     * **ケイデンス** ➔ 180spm付近で裏打ちハイハット
-    * **パワー** ➔ キックに合わせたサイドチェイン（ダッキング）効果の深さ
+    <!-- * **パワー** ➔ キックに合わせたサイドチェイン（ダッキング）効果の深さ -->
     """)
     
     uploaded_file = st.file_uploader("FITファイルをアップロードしてください", type=["fit"])
@@ -745,22 +785,46 @@ def main():
                 
                 status_text.text("生成完了！書き出しています...")
                 
-                output_filename = "generated_track.wav"
-                track.export(output_filename, format="wav")
+                wav_filename = "generated_track.wav"
+                mp3_filename = "generated_track.mp3"
+                
+                track.export(wav_filename, format="wav")
+                # MP3変換 (ffmpegが必要)
+                try:
+                    track.export(mp3_filename, format="mp3", bitrate="192k")
+                    has_mp3 = True
+                except Exception as mp3_error:
+                    st.warning(f"MP3の生成に失敗しました（ffmpegがインストールされていない可能性があります）: {mp3_error}")
+                    has_mp3 = False
                 
                 status_text.text("完成しました！")
                 
                 # Streamlitのaudioプレイヤーで再生
-                st.audio(output_filename, format="audio/wav")
+                if has_mp3:
+                    st.audio(mp3_filename, format="audio/mpeg")
+                else:
+                    st.audio(wav_filename, format="audio/wav")
                 
                 # ダウンロードボタン
-                with open(output_filename, "rb") as file:
-                    st.download_button(
-                        label="⬇️ WAVファイルをダウンロード",
-                        data=file,
-                        file_name="progressive_house_run.wav",
-                        mime="audio/wav"
-                    )
+                col1, col2 = st.columns(2)
+                with col1:
+                    with open(wav_filename, "rb") as file:
+                        st.download_button(
+                            label="⬇️ WAVをダウンロード",
+                            data=file,
+                            file_name="progressive_house_run.wav",
+                            mime="audio/wav"
+                        )
+                
+                if has_mp3:
+                    with col2:
+                        with open(mp3_filename, "rb") as file:
+                            st.download_button(
+                                label="⬇️ MP3をダウンロード",
+                                data=file,
+                                file_name="progressive_house_run.mp3",
+                                mime="audio/mpeg"
+                            )
                     
         except Exception as e:
             st.error(f"エラーが発生しました: {e}")
